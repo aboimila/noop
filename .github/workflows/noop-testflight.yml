@@ -1,0 +1,284 @@
+# Personal TestFlight build for the aboimila/noop fork. See NOOP_TESTFLIGHT.md.
+#
+# Separate from every upstream workflow (app-build, fork-testing-build, fork-release): those stay
+# unsigned/sideload-only and are untouched. This one builds NOOPiOS (with the embedded widget
+# extension, Apple Watch app and watch complication) under the com.aboimila identifiers and signs it
+# for App Store Connect with the repository's App Store Connect API key.
+#
+#   pull_request       Unsigned Release archive + entitlement checks. Never reads an Apple secret.
+#   push to main       Archive, sign for App Store distribution, verify, upload to TestFlight.
+#                      Only for native source changes: a change to this workflow or its helper
+#                      alone does not upload (so merging the setup never uploads by itself).
+#   workflow_dispatch  Archive, sign, verify. Uploads only when "upload" is ticked (default off)
+#                      and only from main.
+#
+# Signing follows the pattern proven in aboimila/atc-main's native.yml, adapted to four bundles:
+# the archive is built with CODE_SIGNING_ALLOWED=NO (so Xcode never asks Apple for a DEVELOPMENT
+# profile, which needs a registered device), every bundle is then ad-hoc signed inside out with its
+# own entitlements so the HealthKit and App Group requests survive, and `xcodebuild -exportArchive`
+# re-signs all four bundles with an Apple Distribution certificate and App Store profiles it
+# fetches or creates through the API key (signingStyle automatic + -allowProvisioningUpdates).
+# The exported .ipa is unpacked and checked before anything is uploaded.
+name: NOOP TestFlight (personal)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Strand/**'
+      - 'StrandiOS/**'
+      - 'StrandiOSShared/**'
+      - 'StrandiOSWidgets/**'
+      - 'NOOPWatch/**'
+      - 'NOOPWatchComplications/**'
+      - 'Packages/**'
+      - 'Config/**'
+      - 'project.yml'
+      - 'Strand.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved'
+      - '.github/noop-testflight/**'
+      - '.github/workflows/noop-testflight.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'Strand/**'
+      - 'StrandiOS/**'
+      - 'StrandiOSShared/**'
+      - 'StrandiOSWidgets/**'
+      - 'NOOPWatch/**'
+      - 'NOOPWatchComplications/**'
+      - 'Packages/**'
+      - 'Config/**'
+      - 'project.yml'
+      - 'Strand.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved'
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: "Upload the signed build to App Store Connect / TestFlight (main only). Leave off to test signing + export."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # PR runs supersede each other; a signing/upload run is never cancelled mid-upload.
+  group: noop-testflight-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ios:
+    name: ${{ github.event_name == 'pull_request' && 'Validate NOOPiOS (unsigned)' || 'Sign NOOPiOS for TestFlight' }}
+    # Personal fork only: never runs upstream or in a fork of this fork.
+    if: github.repository == 'aboimila/noop'
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      BUNDLE_ID_PREFIX: com.aboimila
+      SIGN: ${{ github.event_name != 'pull_request' }}
+      UPLOAD: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.upload) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # App Store Connect accepts uploads only from Xcode 26+ with the iOS 26 SDK, and NOOPiOS needs
+      # that SDK anyway (glassEffect). Pick the newest STABLE Xcode 26+ on the image, never a beta/RC.
+      - name: Select Xcode 26+
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_2[6-9]*.app 2>/dev/null | grep -viE 'beta|candidate|_rc' | sort -V | tail -1 || true)
+          if [ -z "$XCODE" ]; then
+            echo "::error::No stable Xcode 26 or later on this runner. Installed: $(ls /Applications | grep -i xcode | tr '\n' ' ')"
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          XCODE_MAJOR=$(xcodebuild -version | awk '/^Xcode/ { split($2, v, "."); print v[1] }')
+          SDK=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "Using $XCODE, iOS SDK $SDK"
+          [ "$XCODE_MAJOR" -ge 26 ] || { echo "::error::Xcode $XCODE_MAJOR is older than 26"; exit 1; }
+          [ "${SDK%%.*}" -ge 26 ] || { echo "::error::iOS SDK $SDK is older than 26"; exit 1; }
+
+      - name: Check the request and the Apple secrets
+        if: env.SIGN == 'true'
+        env:
+          KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+          PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=0
+          for v in KEY_ID ISSUER_ID PRIVATE_KEY TEAM_ID; do
+            [ -n "${!v}" ] || { echo "::error::A required Apple secret is empty ($v). Needed: APPSTORE_API_KEY_ID, APPSTORE_API_ISSUER_ID, APPSTORE_API_PRIVATE_KEY, APPLE_TEAM_ID."; missing=1; }
+          done
+          if [ "$UPLOAD" = "true" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Uploads are only made from main (this run is on $GITHUB_REF). Re-run on main, or untick 'upload' to test signing only."
+            missing=1
+          fi
+          exit $missing
+
+      - name: Unit-test the signing helper
+        run: python3 -m unittest discover -s .github/noop-testflight -p 'test_*.py'
+
+      # Build number: one integer for the app AND all three embedded bundles (CURRENT_PROJECT_VERSION
+      # is passed on the xcodebuild command line, which applies it to every target; project.yml wires
+      # each CFBundleVersion to it). run_number only ever goes up for this workflow, and the attempt
+      # digit keeps a re-run from re-using a number App Store Connect may already have accepted.
+      - name: Read the version and choose the build number
+        run: |
+          VERSION=$(grep -m1 'MARKETING_VERSION:' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::MARKETING_VERSION '$VERSION' is not x.y.z"; exit 1; }
+          ATTEMPT=$(( GITHUB_RUN_ATTEMPT > 9 ? 9 : GITHUB_RUN_ATTEMPT ))
+          BUILD_NUMBER=$(( GITHUB_RUN_NUMBER * 10 + ATTEMPT ))
+          echo "VERSION_NAME=$VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "ARCHIVE=$RUNNER_TEMP/NOOP.xcarchive" >> "$GITHUB_ENV"
+          echo "NOOP $VERSION ($BUILD_NUMBER)"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      # Personal identifiers through the upstream mechanism: Config/BundleId.xcconfig #include?s the
+      # gitignored BundleIdSecrets.xcconfig, and project.yml derives every bundle id, the App Group
+      # (group.$(BUNDLE_ID_PREFIX).noop.staging) and the watch's companion id from BUNDLE_ID_PREFIX.
+      # Nothing tracked changes. The team id is passed to xcodebuild directly, never written here.
+      - name: Configure com.aboimila identifiers
+        run: |
+          printf 'BUNDLE_ID_PREFIX = %s\n' "$BUNDLE_ID_PREFIX" > Config/BundleIdSecrets.xcconfig
+          cat Config/BundleIdSecrets.xcconfig
+
+      - name: Generate the Xcode project
+        run: |
+          cp .github/noop-testflight/project.testflight.yml project.testflight.yml
+          xcodegen generate --spec project.testflight.yml
+          rm project.testflight.yml
+
+      - name: Resolve Swift packages
+        run: |
+          xcodebuild -resolvePackageDependencies -project Strand.xcodeproj -scheme NOOPiOS
+          git diff --quiet -- Strand.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved \
+            || echo "::warning::Package resolution changed the committed Package.resolved; building with the re-resolved versions."
+
+      - name: Check identifiers, App Group and entitlement files
+        run: python3 .github/noop-testflight/noop_testflight.py check-settings --prefix "$BUNDLE_ID_PREFIX"
+
+      # Release, generic iOS device, UNSIGNED. The team id is handed over when signing so the
+      # archive's metadata names the team the export signs for; on pull requests it stays empty.
+      - name: Archive NOOPiOS (unsigned)
+        env:
+          TEAM_ID: ${{ env.SIGN == 'true' && secrets.APPLE_TEAM_ID || '' }}
+        run: |
+          xcodebuild -project Strand.xcodeproj -scheme NOOPiOS -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$ARCHIVE" \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGN_STYLE=Automatic \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            -quiet archive
+
+      # An unsigned Mach-O carries no entitlements, and the export re-signs with what each archived
+      # binary declares. Ad-hoc sign NOOP.app, NOOPWidgets.appex, NOOPWatch.app and
+      # NOOPWatchComplications.appex (inside out) with their own entitlement files, resolved for
+      # group.com.aboimila.noop.staging, so HealthKit, HealthKit background delivery and the App
+      # Group reach the distribution signature. No certificate, profile or device is involved.
+      - name: Carry each bundle's entitlements into the archive
+        run: python3 .github/noop-testflight/noop_testflight.py embed --archive "$ARCHIVE" --prefix "$BUNDLE_ID_PREFIX"
+
+      - name: Verify the archive (identifiers, versions, entitlements, permissions)
+        run: |
+          python3 .github/noop-testflight/noop_testflight.py verify --archive "$ARCHIVE" \
+            --prefix "$BUNDLE_ID_PREFIX" --mode adhoc --build-number "$BUILD_NUMBER"
+
+      - name: Write the App Store Connect API key
+        if: env.SIGN == 'true'
+        env:
+          PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+        run: |
+          KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          ( umask 077; printf '%s\n' "$PRIVATE_KEY" > "$KEY_PATH" )
+          # Accept the key pasted as-is, or base64-encoded.
+          if ! grep -q 'BEGIN PRIVATE KEY' "$KEY_PATH"; then
+            ( umask 077; printf '%s' "$PRIVATE_KEY" | base64 --decode > "$KEY_PATH.dec" 2>/dev/null ) && mv "$KEY_PATH.dec" "$KEY_PATH" || true
+          fi
+          grep -q 'BEGIN PRIVATE KEY' "$KEY_PATH" || { echo "::error::APPSTORE_API_PRIVATE_KEY is not a .p8 private key (expected the full -----BEGIN PRIVATE KEY----- file contents)."; exit 1; }
+
+      # Distribution signing. app-store-connect + automatic: Xcode uses (or creates) an Apple
+      # Distribution certificate and an App Store profile for each of the four App IDs through the
+      # API key. These profiles carry no device list, so no registered device is ever needed.
+      # testFlightInternalTestingOnly marks the build internal-only in App Store Connect.
+      - name: Sign and export for App Store Connect
+        if: env.SIGN == 'true'
+        env:
+          KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          write_options() {
+            cat > "$RUNNER_TEMP/ExportOptions-$1.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>$1</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+            <key>uploadSymbols</key><true/>
+            <key>testFlightInternalTestingOnly</key><true/>
+          </dict></plist>
+          EOF
+          }
+          write_options export
+          write_options upload
+          xcodebuild -exportArchive -archivePath "$ARCHIVE" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions-export.plist" -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" \
+            -authenticationKeyID "$KEY_ID" -authenticationKeyIssuerID "$ISSUER_ID"
+          ls -la "$RUNNER_TEMP/export"
+
+      # The deployment gate. Fails unless every bundle in the exported .ipa is signed by Apple
+      # Distribution with an App Store profile (no devices, no get-task-allow), carries the right
+      # bundle id, build number and App Group, the app keeps HealthKit + HealthKit background
+      # delivery + bluetooth-central + its Bluetooth/Health usage strings, and the watch app keeps
+      # HealthKit and its companion pairing. Team ids are redacted from the log.
+      - name: Verify the signed app's capabilities
+        if: env.SIGN == 'true'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          IPA=$(ls "$RUNNER_TEMP"/export/*.ipa | head -1)
+          [ -n "$IPA" ] || { echo "::error::The export produced no .ipa"; exit 1; }
+          python3 .github/noop-testflight/noop_testflight.py verify --ipa "$IPA" \
+            --prefix "$BUNDLE_ID_PREFIX" --mode distribution --build-number "$BUILD_NUMBER"
+
+      # Only reached when the verified export above passed. The upload re-signs the same archive
+      # with the same options (only the destination differs) and sends it to App Store Connect.
+      - name: Upload to TestFlight
+        if: env.SIGN == 'true' && env.UPLOAD == 'true'
+        env:
+          KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+        run: |
+          xcodebuild -exportArchive -archivePath "$ARCHIVE" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions-upload.plist" -exportPath "$RUNNER_TEMP/upload" \
+            -allowProvisioningUpdates -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" \
+            -authenticationKeyID "$KEY_ID" -authenticationKeyIssuerID "$ISSUER_ID"
+
+      - name: Remove the signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/AuthKey.p8.dec"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### NOOP ${VERSION_NAME:-?} (${BUILD_NUMBER:-?})"
+            echo
+            if [ "${{ job.status }}" != "success" ]; then
+              echo "**Failed.** Nothing was uploaded unless the 'Upload to TestFlight' step itself succeeded. See the failing step's log."
+            elif [ "$SIGN" != "true" ]; then
+              echo "Unsigned validation passed: com.aboimila identifiers, matching build numbers, and the HealthKit / background-delivery / App Group entitlements are carried into the archive for all four bundles. No Apple credentials were used."
+            elif [ "$UPLOAD" = "true" ]; then
+              echo "Signed for App Store distribution, capabilities verified, and **uploaded** to App Store Connect. It appears under TestFlight for *Aboimila Health Bridge* once Apple finishes processing (usually 5 to 30 minutes)."
+            else
+              echo "Signed for App Store distribution and capabilities verified. **Not uploaded**: run again on main with 'upload' ticked to send it to TestFlight."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

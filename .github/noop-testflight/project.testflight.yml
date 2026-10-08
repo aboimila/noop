@@ -1,0 +1,21 @@
+# CI-only XcodeGen overlay for the personal TestFlight workflow (.github/workflows/noop-testflight.yml).
+#
+# The workflow copies this file to the repository root and runs
+#   xcodegen generate --spec project.testflight.yml
+# so `include: project.yml` resolves against the real upstream spec. XcodeGen merges dictionaries
+# recursively, so this only ADDS the keys below on top of project.yml; every target, source,
+# entitlement and Info.plist property still comes from upstream. Upstream workflows and local
+# `xcodegen generate` never read this file.
+include:
+  - path: project.yml
+
+targets:
+  # An App Store archive must contain exactly one installed product (NOOP.app). XcodeGen's watchOS
+  # preset already sets SKIP_INSTALL=YES for NOOPWatch and NOOPWatchComplications, but nothing sets
+  # it for the iOS widget extension. If the extension also installs itself, Xcode produces a
+  # "generic" archive that cannot be exported for TestFlight. The extension is still embedded in
+  # NOOP.app/PlugIns by NOOPiOS's dependency copy phase; this only stops the stray second install.
+  NOOPiOSWidgets:
+    settings:
+      base:
+        SKIP_INSTALL: YES
